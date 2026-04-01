@@ -40,6 +40,7 @@ Everything else (keywords, required phrase, retries, healthcheck path) is hardco
 
 ## Rules
 
+- **Keep this file up to date** — update CLAUDE.md whenever changes affect project structure, matching logic, env vars, deployment, or conventions
 - Never commit `.env` — it contains API keys
 - Always push changes so GitHub Actions builds a new image
 - When editing keywords, include all Hebrew prefix variations (ב/ל/ה)
