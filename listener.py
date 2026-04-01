@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import time
@@ -51,6 +52,42 @@ client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 def update_healthcheck():
     """Write current timestamp to healthcheck file so Docker can verify we're alive."""
     HEALTHCHECK_FILE.write_text(str(time.time()))
+
+
+JUNK_PATTERNS = [
+    re.compile(r'https?://\S+'),                # URLs
+    re.compile(r't\.me/\S+'),                    # t.me links without https
+    re.compile(r'.*התרעה חריגה.*'),              # header line
+    re.compile(r'.*התראות לפני כולם.*'),         # promo line
+    re.compile(r'.*לשיתוף ב.*לחצו כאן.*'),      # WhatsApp share line
+    re.compile(r'.*לשיתוף ב\s*\u200f?WhatsApp.*'),  # WhatsApp share variant
+    re.compile(r'.*לחצו כאן.*💬.*'),             # "click here" promo
+    re.compile(r'^\s*Telegram\s*$'),             # standalone "Telegram"
+    re.compile(r'^\s*Image\s*$'),                # standalone "Image"
+]
+
+
+def clean_message(text: str) -> str:
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        skip = False
+        for pattern in JUNK_PATTERNS:
+            if pattern.search(line):
+                # For URL patterns, remove just the URL from the line instead of the whole line
+                if pattern.pattern in (r'https?://\S+', r't\.me/\S+'):
+                    line = pattern.sub('', line).strip()
+                    if not line:
+                        skip = True
+                else:
+                    skip = True
+                    break
+        if not skip:
+            cleaned.append(line)
+    result = '\n'.join(cleaned).strip()
+    # Collapse multiple blank lines into one
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result
 
 
 def matches_keywords(text: str) -> list[str]:
@@ -137,8 +174,10 @@ async def main():
                 sender = await event.get_sender()
                 sender_name = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "Unknown"
 
+                cleaned_text = clean_message(text)
+
                 payload = {
-                    "text": text,
+                    "text": cleaned_text,
                     "matched_keywords": matched,
                     "sender": sender_name,
                     "message_id": event.message.id,
