@@ -1,0 +1,10 @@
+services:
+  redalert-notifier:
+    build: .
+    container_name: redalert-notifier
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - SESSION_PATH=/app/session/telegram
+    volumes:
+      - ./session:/app/session

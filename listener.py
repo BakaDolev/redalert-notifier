@@ -1,0 +1,151 @@
+import os
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiohttp
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.errors import (
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedBanError,
+)
+from telethon.tl.functions.messages import CheckChatInviteRequest
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+# Suppress noisy Telethon update logs
+logging.getLogger("telethon").setLevel(logging.WARNING)
+
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
+GROUP = os.environ["TELEGRAM_GROUP"]
+WEBHOOK_URL = os.environ["N8N_WEBHOOK_URL"]
+KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
+REQUIRED_PHRASE = os.environ.get("REQUIRED_PHRASE", "מקור האיום")
+WEBHOOK_RETRIES = int(os.environ.get("WEBHOOK_RETRIES", "3"))
+HEALTHCHECK_FILE = Path(os.environ.get("HEALTHCHECK_FILE", "/tmp/healthcheck"))
+
+SESSION_PATH = os.environ.get("SESSION_PATH", "session/telegram")
+
+client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+
+
+def update_healthcheck():
+    """Write current timestamp to healthcheck file so Docker can verify we're alive."""
+    HEALTHCHECK_FILE.write_text(str(time.time()))
+
+
+def matches_keywords(text: str) -> list[str]:
+    if REQUIRED_PHRASE and REQUIRED_PHRASE not in text:
+        return []
+    return [kw for kw in KEYWORDS if kw in text]
+
+
+async def resolve_group():
+    group = GROUP.strip()
+
+    try:
+        return int(group)
+    except ValueError:
+        pass
+
+    if group.startswith("+"):
+        invite_hash = group[1:]
+        result = await client(CheckChatInviteRequest(invite_hash))
+        if hasattr(result, "chat"):
+            log.info("Resolved invite link to chat: %s (id: %s)", result.chat.title, result.chat.id)
+            return result.chat
+        raise RuntimeError(f"Cannot resolve invite link — you may not have joined this group yet. Result: {result}")
+
+    return group
+
+
+async def send_to_webhook(payload: dict) -> None:
+    for attempt in range(1, WEBHOOK_RETRIES + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status < 400:
+                        log.info("Sent to webhook (status %s)", resp.status)
+                        return
+                    body = await resp.text()
+                    log.error("Webhook returned %s: %s (attempt %s/%s)", resp.status, body, attempt, WEBHOOK_RETRIES)
+        except Exception:
+            log.exception("Webhook request failed (attempt %s/%s)", attempt, WEBHOOK_RETRIES)
+
+        if attempt < WEBHOOK_RETRIES:
+            wait = 2 ** attempt
+            log.info("Retrying in %ss...", wait)
+            await asyncio.sleep(wait)
+
+    log.error("All %s webhook attempts failed for message: %s", WEBHOOK_RETRIES, payload.get("text", "")[:80])
+
+
+async def healthcheck_loop():
+    """Periodically update the healthcheck file to prove the event loop is alive."""
+    while True:
+        update_healthcheck()
+        await asyncio.sleep(30)
+
+
+async def main():
+    while True:
+        try:
+            await client.start()
+
+            group_entity = await resolve_group()
+            log.info("Listening to group: %s", group_entity)
+            log.info("Keywords: %s", KEYWORDS)
+            log.info("Webhook: %s", WEBHOOK_URL)
+
+            @client.on(events.NewMessage(chats=group_entity))
+            async def handler(event):
+                text = event.message.text or ""
+                if not text:
+                    return
+
+                matched = matches_keywords(text)
+                if not matched:
+                    return
+
+                sender = await event.get_sender()
+                sender_name = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "Unknown"
+
+                payload = {
+                    "text": text,
+                    "matched_keywords": matched,
+                    "sender": sender_name,
+                    "message_id": event.message.id,
+                    "timestamp": event.message.date.isoformat(),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "group": str(GROUP),
+                }
+
+                log.info("Matched keywords %s in message: %s", matched, text[:80])
+                await send_to_webhook(payload)
+
+            asyncio.create_task(healthcheck_loop())
+            update_healthcheck()
+            await client.run_until_disconnected()
+
+        except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedBanError) as e:
+            log.critical("Session is dead (%s). Delete session/ folder and re-authenticate.", type(e).__name__)
+            raise SystemExit(1)
+
+        except Exception:
+            log.exception("Disconnected — reconnecting in 10s...")
+            await asyncio.sleep(10)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
