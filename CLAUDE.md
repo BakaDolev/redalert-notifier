@@ -8,7 +8,7 @@ Single-file Python app (`listener.py`) using Telethon to listen to Telegram chan
 
 ## How message matching works
 
-1. Message must contain the **required phrase** `מקור האיום` (confirms it's an actual alert, not news)
+1. Message must contain at least one **trigger phrase**: `מקור האיום`, `יציאות`, or `צפי אזעקות` (confirms it's an actual alert, not news)
 2. Then it checks for **location keywords** (Hebrew, with prefix variations for ב/ל/ה)
 3. Both conditions must be true to trigger the webhook
 

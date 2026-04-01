@@ -38,7 +38,7 @@ KEYWORDS = [
     "כפר יונה", "בכפר יונה", "לכפר יונה",
     "מרכז", "המרכז", "למרכז", "במרכז",
 ]
-REQUIRED_PHRASE = "מקור האיום"
+REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות"]
 WEBHOOK_RETRIES = 3
 HEALTHCHECK_FILE = Path("/tmp/healthcheck")
 
@@ -97,7 +97,7 @@ def clean_message(text: str) -> str:
 
 
 def matches_keywords(text: str) -> list[str]:
-    if REQUIRED_PHRASE and REQUIRED_PHRASE not in text:
+    if REQUIRED_PHRASES and not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
     return [kw for kw in KEYWORDS if kw in text]
 
