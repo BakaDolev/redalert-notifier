@@ -35,6 +35,8 @@ REQUIRED_PHRASE = os.environ.get("REQUIRED_PHRASE", "מקור האיום")
 WEBHOOK_RETRIES = int(os.environ.get("WEBHOOK_RETRIES", "3"))
 HEALTHCHECK_FILE = Path(os.environ.get("HEALTHCHECK_FILE", "/tmp/healthcheck"))
 
+TEST_MODE = os.environ.get("TEST", "false").lower() == "true"
+TEST_GROUP = os.environ.get("TEST_GROUP", "")
 SESSION_PATH = os.environ.get("SESSION_PATH", "session/telegram")
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
@@ -51,8 +53,8 @@ def matches_keywords(text: str) -> list[str]:
     return [kw for kw in KEYWORDS if kw in text]
 
 
-async def resolve_group():
-    group = GROUP.strip()
+async def resolve_invite(group_str: str):
+    group = group_str.strip()
 
     try:
         return int(group)
@@ -68,6 +70,14 @@ async def resolve_group():
         raise RuntimeError(f"Cannot resolve invite link — you may not have joined this group yet. Result: {result}")
 
     return group
+
+
+async def resolve_groups():
+    groups = [await resolve_invite(GROUP)]
+    if TEST_MODE and TEST_GROUP:
+        log.info("TEST mode enabled — also listening to test group")
+        groups.append(await resolve_invite(TEST_GROUP))
+    return groups
 
 
 async def send_to_webhook(payload: dict) -> None:
@@ -103,12 +113,12 @@ async def main():
         try:
             await client.start()
 
-            group_entity = await resolve_group()
-            log.info("Listening to group: %s", group_entity)
+            chats = await resolve_groups()
+            log.info("Listening to %d group(s)", len(chats))
             log.info("Keywords: %s", KEYWORDS)
             log.info("Webhook: %s", WEBHOOK_URL)
 
-            @client.on(events.NewMessage(chats=group_entity))
+            @client.on(events.NewMessage(chats=chats))
             async def handler(event):
                 text = event.message.text or ""
                 if not text:
