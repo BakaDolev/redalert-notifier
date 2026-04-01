@@ -30,10 +30,16 @@ API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 GROUP = os.environ["TELEGRAM_GROUP"]
 WEBHOOK_URL = os.environ["N8N_WEBHOOK_URL"]
-KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
-REQUIRED_PHRASE = os.environ.get("REQUIRED_PHRASE", "מקור האיום")
-WEBHOOK_RETRIES = int(os.environ.get("WEBHOOK_RETRIES", "3"))
-HEALTHCHECK_FILE = Path(os.environ.get("HEALTHCHECK_FILE", "/tmp/healthcheck"))
+
+KEYWORDS = [
+    "השרון", "לשרון", "בשרון", "שרון",
+    "נתניה", "לנתניה", "בנתניה",
+    "כפר יונה", "בכפר יונה", "לכפר יונה",
+    "מרכז", "המרכז", "למרכז", "במרכז",
+]
+REQUIRED_PHRASE = "מקור האיום"
+WEBHOOK_RETRIES = 3
+HEALTHCHECK_FILE = Path("/tmp/healthcheck")
 
 TEST_MODE = os.environ.get("TEST", "false").lower() == "true"
 TEST_GROUP = os.environ.get("TEST_GROUP", "")
