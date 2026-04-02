@@ -48,11 +48,12 @@ SESSION_PATH = os.environ.get("SESSION_PATH", "session/telegram")
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 
+# Global session for webhook reuse
+http_session = None
 
 def update_healthcheck():
     """Write current timestamp to healthcheck file so Docker can verify we're alive."""
     HEALTHCHECK_FILE.write_text(str(time.time()))
-
 
 JUNK_PATTERNS = [
     re.compile(r'https?://\S+'),                # URLs
@@ -66,7 +67,6 @@ JUNK_PATTERNS = [
     re.compile(r'^\s*Image\s*$'),                # standalone "Image"
 ]
 
-
 def clean_message(text: str) -> str:
     lines = text.split('\n')
     cleaned = []
@@ -74,7 +74,6 @@ def clean_message(text: str) -> str:
         skip = False
         for pattern in JUNK_PATTERNS:
             if pattern.search(line):
-                # For URL patterns, remove just the URL from the line instead of the whole line
                 if pattern.pattern in (r'https?://\S+', r't\.me/\S+'):
                     line = pattern.sub('', line).strip()
                     if not line:
@@ -85,31 +84,23 @@ def clean_message(text: str) -> str:
         if not skip:
             cleaned.append(line)
     result = '\n'.join(cleaned).strip()
-    # Collapse multiple blank lines into one
     result = re.sub(r'\n{3,}', '\n\n', result)
-    # Remove emojis
     result = re.sub(r'[\U0001F300-\U0001FAFF\U00002702-\U000027B0\U0000FE00-\U0000FE0F\U0000200D\U00002600-\U000026FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF]+', '', result)
-    # Remove flag emojis (regional indicators)
     result = re.sub(r'[\U0001F1E0-\U0001F1FF]{2}', '', result)
-    # Clean up extra spaces left behind
     result = re.sub(r'  +', ' ', result)
     return result
-
 
 def matches_keywords(text: str) -> list[str]:
     if REQUIRED_PHRASES and not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
     return [kw for kw in KEYWORDS if kw in text]
 
-
 async def resolve_invite(group_str: str):
     group = group_str.strip()
-
     try:
         return int(group)
     except ValueError:
         pass
-
     if group.startswith("+"):
         invite_hash = group[1:]
         result = await client(CheckChatInviteRequest(invite_hash))
@@ -117,9 +108,7 @@ async def resolve_invite(group_str: str):
             log.info("Resolved invite link to chat: %s (id: %s)", result.chat.title, result.chat.id)
             return result.chat
         raise RuntimeError(f"Cannot resolve invite link — you may not have joined this group yet. Result: {result}")
-
     return group
-
 
 async def resolve_groups():
     groups = [await resolve_invite(GROUP)]
@@ -128,17 +117,16 @@ async def resolve_groups():
         groups.append(await resolve_invite(TEST_GROUP))
     return groups
 
-
 async def send_to_webhook(payload: dict) -> None:
     for attempt in range(1, WEBHOOK_RETRIES + 1):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status < 400:
-                        log.info("Sent to webhook (status %s)", resp.status)
-                        return
-                    body = await resp.text()
-                    log.error("Webhook returned %s: %s (attempt %s/%s)", resp.status, body, attempt, WEBHOOK_RETRIES)
+            # Uses the persistent, non-blocking global HTTP session
+            async with http_session.post(WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status < 400:
+                    log.info("Sent to webhook (status %s)", resp.status)
+                    return
+                body = await resp.text()
+                log.error("Webhook returned %s: %s (attempt %s/%s)", resp.status, body, attempt, WEBHOOK_RETRIES)
         except Exception:
             log.exception("Webhook request failed (attempt %s/%s)", attempt, WEBHOOK_RETRIES)
 
@@ -149,18 +137,22 @@ async def send_to_webhook(payload: dict) -> None:
 
     log.error("All %s webhook attempts failed for message: %s", WEBHOOK_RETRIES, payload.get("text", "")[:80])
 
-
 async def healthcheck_loop():
-    """Periodically update the healthcheck file to prove the event loop is alive."""
     while True:
         update_healthcheck()
         await asyncio.sleep(30)
 
-
 async def main():
+    global http_session
+    http_session = aiohttp.ClientSession()
+    
     while True:
         try:
             await client.start()
+            
+            # Prime the cache to ensure instant push notifications instead of slow polling
+            log.info("Fetching dialogs to prime the entity cache for real-time updates...")
+            await client.get_dialogs()
 
             chats = await resolve_groups()
             log.info("Listening to %d group(s)", len(chats))
@@ -169,6 +161,7 @@ async def main():
 
             @client.on(events.NewMessage(chats=chats))
             async def handler(event):
+                # 1. Zero-latency memory checks
                 text = event.message.text or ""
                 if not text:
                     return
@@ -177,23 +170,27 @@ async def main():
                 if not matched:
                     return
 
-                sender = await event.get_sender()
-                sender_name = getattr(sender, "first_name", "") or getattr(sender, "title", "") or "Unknown"
+                # 2. Fire-and-forget background task
+                async def process_and_send():
+                    try:
+                        cleaned_text = clean_message(text)
 
-                cleaned_text = clean_message(text)
+                        payload = {
+                            "text": cleaned_text,
+                            "matched_keywords": matched,
+                            "sender": "Alert_Channel", # Hardcoded to skip the slow API call 
+                            "message_id": event.message.id,
+                            "timestamp": event.message.date.isoformat(),
+                            "received_at": datetime.now(timezone.utc).isoformat(),
+                            "group": str(GROUP),
+                        }
 
-                payload = {
-                    "text": cleaned_text,
-                    "matched_keywords": matched,
-                    "sender": sender_name,
-                    "message_id": event.message.id,
-                    "timestamp": event.message.date.isoformat(),
-                    "received_at": datetime.now(timezone.utc).isoformat(),
-                    "group": str(GROUP),
-                }
+                        log.info("Matched keywords %s in message: %s", matched, text[:80])
+                        await send_to_webhook(payload)
+                    except Exception as e:
+                        log.error("Failed to process and send message %s: %s", event.message.id, e)
 
-                log.info("Matched keywords %s in message: %s", matched, text[:80])
-                await send_to_webhook(payload)
+                asyncio.create_task(process_and_send())
 
             asyncio.create_task(healthcheck_loop())
             update_healthcheck()
@@ -206,7 +203,11 @@ async def main():
         except Exception:
             log.exception("Disconnected — reconnecting in 10s...")
             await asyncio.sleep(10)
-
+            
+        finally:
+            # Clean up the HTTP session properly to prevent memory leaks 
+            if http_session and not http_session.closed:
+                await http_session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
