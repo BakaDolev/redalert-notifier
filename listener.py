@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,14 +47,55 @@ TEST_MODE = os.environ.get("TEST", "false").lower() == "true"
 TEST_GROUP = os.environ.get("TEST_GROUP", "")
 SESSION_PATH = os.environ.get("SESSION_PATH", "session/telegram")
 
+# Track processed messages to avoid duplicates
+# Key: message_id, Value: set of matched keywords that were already sent
+MAX_TRACKED_MESSAGES = 50  # Keep last 50 messages in memory
+processed_messages: OrderedDict[int, set[str]] = OrderedDict()
+
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 
 # Global session for webhook reuse
 http_session = None
 
+
+def track_message(message_id: int, keywords: list[str]) -> list[str]:
+    """
+    Track a processed message and return only NEW keywords not previously sent.
+    This prevents spam when a message is edited multiple times.
+    """
+    global processed_messages
+    
+    keywords_set = set(keywords)
+    
+    if message_id in processed_messages:
+        # Get keywords we haven't sent yet for this message
+        already_sent = processed_messages[message_id]
+        new_keywords = keywords_set - already_sent
+        
+        if new_keywords:
+            # Update with new keywords
+            processed_messages[message_id].update(new_keywords)
+            # Move to end (most recent)
+            processed_messages.move_to_end(message_id)
+            return list(new_keywords)
+        else:
+            # All keywords were already sent - skip
+            return []
+    else:
+        # New message - track it
+        processed_messages[message_id] = keywords_set
+        
+        # Prune old messages if we exceed the limit
+        while len(processed_messages) > MAX_TRACKED_MESSAGES:
+            processed_messages.popitem(last=False)
+        
+        return keywords
+
+
 def update_healthcheck():
     """Write current timestamp to healthcheck file so Docker can verify we're alive."""
     HEALTHCHECK_FILE.write_text(str(time.time()))
+
 
 JUNK_PATTERNS = [
     re.compile(r'https?://\S+'),                # URLs
@@ -66,6 +108,7 @@ JUNK_PATTERNS = [
     re.compile(r'^\s*Telegram\s*$'),             # standalone "Telegram"
     re.compile(r'^\s*Image\s*$'),                # standalone "Image"
 ]
+
 
 def clean_message(text: str) -> str:
     lines = text.split('\n')
@@ -90,10 +133,12 @@ def clean_message(text: str) -> str:
     result = re.sub(r'  +', ' ', result)
     return result
 
+
 def matches_keywords(text: str) -> list[str]:
     if REQUIRED_PHRASES and not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
     return [kw for kw in KEYWORDS if kw in text]
+
 
 async def resolve_invite(group_str: str):
     group = group_str.strip()
@@ -110,6 +155,7 @@ async def resolve_invite(group_str: str):
         raise RuntimeError(f"Cannot resolve invite link — you may not have joined this group yet. Result: {result}")
     return group
 
+
 async def resolve_groups():
     groups = [await resolve_invite(GROUP)]
     if TEST_MODE and TEST_GROUP:
@@ -117,10 +163,10 @@ async def resolve_groups():
         groups.append(await resolve_invite(TEST_GROUP))
     return groups
 
+
 async def send_to_webhook(payload: dict) -> None:
     for attempt in range(1, WEBHOOK_RETRIES + 1):
         try:
-            # Uses the persistent, non-blocking global HTTP session
             async with http_session.post(WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status < 400:
                     log.info("Sent to webhook (status %s)", resp.status)
@@ -137,10 +183,12 @@ async def send_to_webhook(payload: dict) -> None:
 
     log.error("All %s webhook attempts failed for message: %s", WEBHOOK_RETRIES, payload.get("text", "")[:80])
 
+
 async def healthcheck_loop():
     while True:
         update_healthcheck()
         await asyncio.sleep(30)
+
 
 async def main():
     global http_session
@@ -159,8 +207,12 @@ async def main():
             log.info("Keywords: %s", KEYWORDS)
             log.info("Webhook: %s", WEBHOOK_URL)
 
+            # Handler for both new messages AND edited messages
             @client.on(events.NewMessage(chats=chats))
+            @client.on(events.MessageEdited(chats=chats))
             async def handler(event):
+                is_edit = isinstance(event, events.MessageEdited.Event)
+                
                 # 1. Zero-latency memory checks
                 text = event.message.text or ""
                 if not text:
@@ -170,22 +222,31 @@ async def main():
                 if not matched:
                     return
 
-                # 2. Fire-and-forget background task
+                # 2. Check if we already processed this message with these keywords
+                new_keywords = track_message(event.message.id, matched)
+                if not new_keywords:
+                    log.debug("Skipping message %s - already processed with same keywords", event.message.id)
+                    return
+
+                # 3. Fire-and-forget background task
                 async def process_and_send():
                     try:
                         cleaned_text = clean_message(text)
 
                         payload = {
                             "text": cleaned_text,
-                            "matched_keywords": matched,
-                            "sender": "Alert_Channel", # Hardcoded to skip the slow API call 
+                            "matched_keywords": new_keywords,
+                            "sender": "Alert_Channel",
                             "message_id": event.message.id,
                             "timestamp": event.message.date.isoformat(),
                             "received_at": datetime.now(timezone.utc).isoformat(),
                             "group": str(GROUP),
+                            "is_edit": is_edit,
                         }
 
-                        log.info("Matched keywords %s in message: %s", matched, text[:80])
+                        action = "EDIT" if is_edit else "NEW"
+                        log.info("[%s] Matched keywords %s in message %s: %s", 
+                                 action, new_keywords, event.message.id, text[:80])
                         await send_to_webhook(payload)
                     except Exception as e:
                         log.error("Failed to process and send message %s: %s", event.message.id, e)
@@ -205,9 +266,9 @@ async def main():
             await asyncio.sleep(10)
             
         finally:
-            # Clean up the HTTP session properly to prevent memory leaks 
             if http_session and not http_session.closed:
                 await http_session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
