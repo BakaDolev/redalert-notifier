@@ -3,13 +3,13 @@ import re
 import asyncio
 import logging
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyUnregisteredError,
     SessionRevokedError,
@@ -41,16 +41,7 @@ KEYWORDS = [
     'איו"ש', "שומרון", "בשומרון", "לשומרון",
 ]
 REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות"]
-# Broader alert indicators used only when combining with recent context messages
-CONTEXT_PHRASES = [
-    "זוהה מאיראן", "זוהה מלבנון", "זוהה מתימן",
-    "שיגורים מאיראן", "שיגורים מלבנון",
-    "לאיזור:", "אזור יעד",
-    "איום לישראל",
-]
-RECENT_MSG_WINDOW_SECS = 600  # 10 minutes
-MAX_RECENT_MSGS_PER_CHAT = 5
-recent_msg_buffer: dict[int, deque] = {}
+POLL_INTERVAL = 3   # seconds between polls
 WEBHOOK_RETRIES = 3
 HEALTHCHECK_FILE = Path("/tmp/healthcheck")
 
@@ -58,84 +49,38 @@ TEST_MODE = os.environ.get("TEST", "false").lower() == "true"
 TEST_GROUP = os.environ.get("TEST_GROUP", "")
 SESSION_PATH = os.environ.get("SESSION_PATH", "session/telegram")
 
-# Track processed messages to avoid duplicates
-# Key: message_id, Value: set of matched keywords that were already sent
-MAX_TRACKED_MESSAGES = 50  # Keep last 50 messages in memory
-processed_messages: OrderedDict[int, set[str]] = OrderedDict()
+# Track processed message IDs to avoid duplicates
+MAX_TRACKED_MESSAGES = 200
+processed_messages: OrderedDict[int, bool] = OrderedDict()
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-
-# Global session for webhook reuse
 http_session = None
 
 
-def track_message(message_id: int, keywords: list[str]) -> list[str]:
-    """
-    Track a processed message and return only NEW keywords not previously sent.
-    This prevents spam when a message is edited multiple times.
-    """
-    global processed_messages
-    
-    keywords_set = set(keywords)
-    
-    if message_id in processed_messages:
-        # Get keywords we haven't sent yet for this message
-        already_sent = processed_messages[message_id]
-        new_keywords = keywords_set - already_sent
-        
-        if new_keywords:
-            # Update with new keywords
-            processed_messages[message_id].update(new_keywords)
-            # Move to end (most recent)
-            processed_messages.move_to_end(message_id)
-            return list(new_keywords)
-        else:
-            # All keywords were already sent - skip
-            return []
-    else:
-        # New message - track it
-        processed_messages[message_id] = keywords_set
-        
-        # Prune old messages if we exceed the limit
-        while len(processed_messages) > MAX_TRACKED_MESSAGES:
-            processed_messages.popitem(last=False)
-        
-        return keywords
+def is_processed(message_id: int) -> bool:
+    return message_id in processed_messages
 
 
-def add_to_buffer(chat_id: int, message_id: int, text: str):
-    if chat_id not in recent_msg_buffer:
-        recent_msg_buffer[chat_id] = deque(maxlen=MAX_RECENT_MSGS_PER_CHAT)
-    recent_msg_buffer[chat_id].append((time.time(), message_id, text))
-
-
-def get_recent_context(chat_id: int, exclude_id: int) -> str:
-    """Return combined raw text of recent messages for this chat, excluding the current one."""
-    if chat_id not in recent_msg_buffer:
-        return ""
-    cutoff = time.time() - RECENT_MSG_WINDOW_SECS
-    texts = [
-        text for ts, mid, text in recent_msg_buffer[chat_id]
-        if ts >= cutoff and mid != exclude_id
-    ]
-    return "\n".join(texts)
+def mark_processed(message_id: int):
+    processed_messages[message_id] = True
+    while len(processed_messages) > MAX_TRACKED_MESSAGES:
+        processed_messages.popitem(last=False)
 
 
 def update_healthcheck():
-    """Write current timestamp to healthcheck file so Docker can verify we're alive."""
     HEALTHCHECK_FILE.write_text(str(time.time()))
 
 
 JUNK_PATTERNS = [
-    re.compile(r'https?://\S+'),                # URLs
-    re.compile(r't\.me/\S+'),                    # t.me links without https
-    re.compile(r'.*התרעה חריגה.*'),              # header line
-    re.compile(r'.*התראות לפני כולם.*'),         # promo line
-    re.compile(r'.*לשיתוף ב.*לחצו כאן.*'),      # WhatsApp share line
-    re.compile(r'.*לשיתוף ב\s*\u200f?WhatsApp.*'),  # WhatsApp share variant
-    re.compile(r'.*לחצו כאן.*💬.*'),             # "click here" promo
-    re.compile(r'^\s*Telegram\s*$'),             # standalone "Telegram"
-    re.compile(r'^\s*Image\s*$'),                # standalone "Image"
+    re.compile(r'https?://\S+'),
+    re.compile(r't\.me/\S+'),
+    re.compile(r'.*התרעה חריגה.*'),
+    re.compile(r'.*התראות לפני כולם.*'),
+    re.compile(r'.*לשיתוף ב.*לחצו כאן.*'),
+    re.compile(r'.*לשיתוף ב\s*\u200f?WhatsApp.*'),
+    re.compile(r'.*לחצו כאן.*💬.*'),
+    re.compile(r'^\s*Telegram\s*$'),
+    re.compile(r'^\s*Image\s*$'),
 ]
 
 
@@ -167,20 +112,6 @@ def matches_keywords(text: str) -> list[str]:
     if not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
     return [kw for kw in KEYWORDS if kw in text]
-
-
-def matches_keywords_in_context(current_text: str, context_text: str) -> list[str]:
-    """
-    Match when: current message has a keyword AND combined context has any alert phrase.
-    Used for follow-up messages like 'גם לשרון' that lack a required phrase on their own.
-    """
-    matched_kws = [kw for kw in KEYWORDS if kw in current_text]
-    if not matched_kws:
-        return []
-    combined = context_text + "\n" + current_text
-    if any(phrase in combined for phrase in REQUIRED_PHRASES + CONTEXT_PHRASES):
-        return matched_kws
-    return []
 
 
 async def resolve_invite(group_str: str):
@@ -218,13 +149,11 @@ async def send_to_webhook(payload: dict) -> None:
                 log.error("Webhook returned %s: %s (attempt %s/%s)", resp.status, body, attempt, WEBHOOK_RETRIES)
         except Exception:
             log.exception("Webhook request failed (attempt %s/%s)", attempt, WEBHOOK_RETRIES)
-
         if attempt < WEBHOOK_RETRIES:
             wait = 2 ** attempt
             log.info("Retrying in %ss...", wait)
             await asyncio.sleep(wait)
-
-    log.error("All %s webhook attempts failed for message: %s", WEBHOOK_RETRIES, payload.get("text", "")[:80])
+    log.error("All %s webhook attempts failed", WEBHOOK_RETRIES)
 
 
 async def healthcheck_loop():
@@ -233,91 +162,66 @@ async def healthcheck_loop():
         await asyncio.sleep(30)
 
 
+async def poll_chat(chat, min_id: int) -> int:
+    """Poll for new messages in a chat since min_id. Returns the new highest message ID seen."""
+    messages = await client.get_messages(chat, limit=10, min_id=min_id)
+    if not messages:
+        return min_id
+
+    new_max_id = min_id
+    for msg in reversed(messages):  # oldest first
+        new_max_id = max(new_max_id, msg.id)
+        text = msg.text or ""
+        if not text or is_processed(msg.id):
+            continue
+        matched = matches_keywords(text)
+        if not matched:
+            continue
+        mark_processed(msg.id)
+        cleaned_text = clean_message(text)
+        payload = {
+            "text": cleaned_text,
+            "matched_keywords": matched,
+            "sender": "Alert_Channel",
+            "message_id": msg.id,
+            "timestamp": msg.date.isoformat(),
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "group": str(GROUP),
+        }
+        log.info("Matched keywords %s in message %s: %s", matched, msg.id, text[:80])
+        await send_to_webhook(payload)
+
+    return new_max_id
+
+
 async def main():
     global http_session
     http_session = aiohttp.ClientSession()
-    
+
     while True:
         try:
             await client.start()
-            
-            # Prime the cache to ensure instant push notifications instead of slow polling
-            log.info("Fetching dialogs to prime the entity cache for real-time updates...")
-            await client.get_dialogs()
 
             chats = await resolve_groups()
-            log.info("Listening to %d group(s)", len(chats))
+            log.info("Polling %d group(s) every %ss", len(chats), POLL_INTERVAL)
             log.info("Keywords: %s", KEYWORDS)
             log.info("Webhook: %s", WEBHOOK_URL)
 
-            # Handler for both new messages AND edited messages
-            @client.on(events.NewMessage(chats=chats))
-            @client.on(events.MessageEdited(chats=chats))
-            async def handler(event):
-                is_edit = isinstance(event, events.MessageEdited.Event)
-
-                # 1. Zero-latency memory checks
-                text = event.message.text or ""
-                if not text:
-                    return
-
-                chat_id = event.chat_id
-
-                # Add new messages to the recent buffer for context matching
-                if not is_edit:
-                    add_to_buffer(chat_id, event.message.id, text)
-
-                # Try standalone match first
-                matched = matches_keywords(text)
-                used_context = False
-                context_text = ""
-
-                # If no standalone match, try combining with recent messages
-                if not matched and not is_edit:
-                    context_text = get_recent_context(chat_id, event.message.id)
-                    if context_text:
-                        matched = matches_keywords_in_context(text, context_text)
-                        if matched:
-                            used_context = True
-
-                if not matched:
-                    return
-
-                # 2. Check if we already processed this message with these keywords
-                new_keywords = track_message(event.message.id, matched)
-                if not new_keywords:
-                    log.debug("Skipping message %s - already processed with same keywords", event.message.id)
-                    return
-
-                # 3. Fire-and-forget background task
-                async def process_and_send():
-                    try:
-                        send_text = (context_text + "\n" + text) if used_context else text
-                        cleaned_text = clean_message(send_text)
-
-                        payload = {
-                            "text": cleaned_text,
-                            "matched_keywords": new_keywords,
-                            "sender": "Alert_Channel",
-                            "message_id": event.message.id,
-                            "timestamp": event.message.date.isoformat(),
-                            "received_at": datetime.now(timezone.utc).isoformat(),
-                            "group": str(GROUP),
-                            "is_edit": is_edit,
-                        }
-
-                        action = "EDIT" if is_edit else ("CONTEXT" if used_context else "NEW")
-                        log.info("[%s] Matched keywords %s in message %s: %s",
-                                 action, new_keywords, event.message.id, text[:80])
-                        await send_to_webhook(payload)
-                    except Exception as e:
-                        log.error("Failed to process and send message %s: %s", event.message.id, e)
-
-                asyncio.create_task(process_and_send())
+            # Seed min_id with the latest message so we only process new ones
+            min_ids = {}
+            for chat in chats:
+                msgs = await client.get_messages(chat, limit=1)
+                min_ids[id(chat)] = msgs[0].id if msgs else 0
 
             asyncio.create_task(healthcheck_loop())
             update_healthcheck()
-            await client.run_until_disconnected()
+
+            while True:
+                await asyncio.sleep(POLL_INTERVAL)
+                update_healthcheck()
+                for chat in chats:
+                    key = id(chat)
+                    min_ids[key] = await poll_chat(chat, min_ids[key])
 
         except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedBanError) as e:
             log.critical("Session is dead (%s). Delete session/ folder and re-authenticate.", type(e).__name__)
@@ -326,7 +230,7 @@ async def main():
         except Exception:
             log.exception("Disconnected — reconnecting in 10s...")
             await asyncio.sleep(10)
-            
+
         finally:
             if http_session and not http_session.closed:
                 await http_session.close()
