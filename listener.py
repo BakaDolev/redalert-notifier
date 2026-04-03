@@ -38,6 +38,7 @@ KEYWORDS = [
     "נתניה", "לנתניה", "בנתניה",
     "כפר יונה", "בכפר יונה", "לכפר יונה",
     "מרכז", "המרכז", "למרכז", "במרכז",
+    'איו"ש', "שומרון", "בשומרון", "לשומרון",
 ]
 REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות"]
 # Broader alert indicators used only when combining with recent context messages
