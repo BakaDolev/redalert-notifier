@@ -3,7 +3,7 @@ import re
 import asyncio
 import logging
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +40,16 @@ KEYWORDS = [
     "מרכז", "המרכז", "למרכז", "במרכז",
 ]
 REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות"]
+# Broader alert indicators used only when combining with recent context messages
+CONTEXT_PHRASES = [
+    "זוהה מאיראן", "זוהה מלבנון", "זוהה מתימן",
+    "שיגורים מאיראן", "שיגורים מלבנון",
+    "לאיזור:", "אזור יעד",
+    "איום לישראל",
+]
+RECENT_MSG_WINDOW_SECS = 600  # 10 minutes
+MAX_RECENT_MSGS_PER_CHAT = 5
+recent_msg_buffer: dict[int, deque] = {}
 WEBHOOK_RETRIES = 3
 HEALTHCHECK_FILE = Path("/tmp/healthcheck")
 
@@ -92,6 +102,24 @@ def track_message(message_id: int, keywords: list[str]) -> list[str]:
         return keywords
 
 
+def add_to_buffer(chat_id: int, message_id: int, text: str):
+    if chat_id not in recent_msg_buffer:
+        recent_msg_buffer[chat_id] = deque(maxlen=MAX_RECENT_MSGS_PER_CHAT)
+    recent_msg_buffer[chat_id].append((time.time(), message_id, text))
+
+
+def get_recent_context(chat_id: int, exclude_id: int) -> str:
+    """Return combined raw text of recent messages for this chat, excluding the current one."""
+    if chat_id not in recent_msg_buffer:
+        return ""
+    cutoff = time.time() - RECENT_MSG_WINDOW_SECS
+    texts = [
+        text for ts, mid, text in recent_msg_buffer[chat_id]
+        if ts >= cutoff and mid != exclude_id
+    ]
+    return "\n".join(texts)
+
+
 def update_healthcheck():
     """Write current timestamp to healthcheck file so Docker can verify we're alive."""
     HEALTHCHECK_FILE.write_text(str(time.time()))
@@ -135,9 +163,23 @@ def clean_message(text: str) -> str:
 
 
 def matches_keywords(text: str) -> list[str]:
-    if REQUIRED_PHRASES and not any(phrase in text for phrase in REQUIRED_PHRASES):
+    if not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
     return [kw for kw in KEYWORDS if kw in text]
+
+
+def matches_keywords_in_context(current_text: str, context_text: str) -> list[str]:
+    """
+    Match when: current message has a keyword AND combined context has any alert phrase.
+    Used for follow-up messages like 'גם לשרון' that lack a required phrase on their own.
+    """
+    matched_kws = [kw for kw in KEYWORDS if kw in current_text]
+    if not matched_kws:
+        return []
+    combined = context_text + "\n" + current_text
+    if any(phrase in combined for phrase in REQUIRED_PHRASES + CONTEXT_PHRASES):
+        return matched_kws
+    return []
 
 
 async def resolve_invite(group_str: str):
@@ -212,13 +254,31 @@ async def main():
             @client.on(events.MessageEdited(chats=chats))
             async def handler(event):
                 is_edit = isinstance(event, events.MessageEdited.Event)
-                
+
                 # 1. Zero-latency memory checks
                 text = event.message.text or ""
                 if not text:
                     return
 
+                chat_id = event.chat_id
+
+                # Add new messages to the recent buffer for context matching
+                if not is_edit:
+                    add_to_buffer(chat_id, event.message.id, text)
+
+                # Try standalone match first
                 matched = matches_keywords(text)
+                used_context = False
+                context_text = ""
+
+                # If no standalone match, try combining with recent messages
+                if not matched and not is_edit:
+                    context_text = get_recent_context(chat_id, event.message.id)
+                    if context_text:
+                        matched = matches_keywords_in_context(text, context_text)
+                        if matched:
+                            used_context = True
+
                 if not matched:
                     return
 
@@ -231,7 +291,8 @@ async def main():
                 # 3. Fire-and-forget background task
                 async def process_and_send():
                     try:
-                        cleaned_text = clean_message(text)
+                        send_text = (context_text + "\n" + text) if used_context else text
+                        cleaned_text = clean_message(send_text)
 
                         payload = {
                             "text": cleaned_text,
@@ -244,8 +305,8 @@ async def main():
                             "is_edit": is_edit,
                         }
 
-                        action = "EDIT" if is_edit else "NEW"
-                        log.info("[%s] Matched keywords %s in message %s: %s", 
+                        action = "EDIT" if is_edit else ("CONTEXT" if used_context else "NEW")
+                        log.info("[%s] Matched keywords %s in message %s: %s",
                                  action, new_keywords, event.message.id, text[:80])
                         await send_to_webhook(payload)
                     except Exception as e:
