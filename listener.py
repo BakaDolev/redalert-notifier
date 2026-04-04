@@ -184,17 +184,24 @@ async def healthcheck_loop():
         await asyncio.sleep(30)
 
 
-async def process_message(msg, is_edit: bool = False):
+async def process_message(msg, is_edit: bool = False, source: str = "event"):
     global last_alert_text, last_alert_time
 
     text = msg.text or ""
     if not text or not should_process(msg.id, text):
         return False
 
+    lag = (datetime.now(timezone.utc) - msg.date.astimezone(timezone.utc)).total_seconds()
+    if lag > 30:
+        log.warning("[LAG] msg %s posted %s, delivery lag %.0fs (source: %s)", msg.id, msg.date.isoformat(), lag, source)
+
+    prev_text = processed_messages.get(msg.id)
     matched = matches_keywords(text)
     mark_processed(msg.id, text)
 
     if not matched:
+        if prev_text is not None and prev_text != text:
+            log.info("[EDIT-MISS] msg %s text changed but still no match. prev=%s... new=%s...", msg.id, prev_text[:60], text[:60])
         return False
 
     cleaned_text = clean_message(text)
@@ -224,7 +231,7 @@ async def process_message(msg, is_edit: bool = False):
         "context": last_alert_text if last_alert_text else None,
     }
 
-    log.info("[%s] Matched %s in msg %s: %s", action, matched, msg.id, text[:80])
+    log.info("[%s][%s] Matched %s in msg %s (lag %.0fs): %s", action, source, matched, msg.id, lag, text[:80])
     await send_to_webhook(payload)
 
     # Update last alert context (not for interceptions — they are follow-ups, not the alert itself)
@@ -247,7 +254,7 @@ async def poll_loop(chats, min_ids: dict):
                 if messages:
                     for msg in reversed(messages):
                         min_ids[key] = max(min_ids[key], msg.id)
-                        await process_message(msg, is_edit=False)
+                        await process_message(msg, is_edit=False, source="poll")
             except Exception:
                 log.exception("Poll error for chat %s", key)
 
