@@ -197,9 +197,10 @@ async def poll_chat(chat, min_id: int) -> int:
 
 async def main():
     global http_session
-    http_session = aiohttp.ClientSession()
 
     while True:
+        if http_session is None or http_session.closed:
+            http_session = aiohttp.ClientSession()
         try:
             await client.start()
 
