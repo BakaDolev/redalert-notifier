@@ -41,9 +41,10 @@ KEYWORDS = [
     'איו"ש', "שומרון", "בשומרון", "לשומרון",
     "גוש דן", "בגוש דן", "לגוש דן",
 ]
-REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות", "שיגורים", "איום לישראל", "זוהה", "גם", "מיקוד הטיל"]
+REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות", "שיגורים", "שיגור", "איום לישראל", "זוהה", "גם", "מיקוד הטיל"]
 INTERCEPTION_PHRASES = ["יורט"]
 FOLLOWUP_WINDOW = 30 * 60  # seconds — interception alerts sent only within this window after a match
+PENDING_CORRELATION_WINDOW = 30  # seconds — hold trigger-only messages waiting for a location follow-up
 POLL_INTERVAL = 10  # fallback poll interval in seconds
 WEBHOOK_RETRIES = 3
 TEXT_DEDUP_WINDOW = 5 * 60  # seconds — suppress duplicate text content within this window
@@ -66,6 +67,10 @@ http_session = None
 # Track last sent alert for follow-up context
 last_alert_text: str = ""
 last_alert_time: datetime | None = None
+
+# Track pending trigger-only messages awaiting a location follow-up
+pending_trigger_text: str = ""
+pending_trigger_time: float = 0.0
 
 
 def should_process(message_id: int, text: str) -> bool:
@@ -185,7 +190,7 @@ async def healthcheck_loop():
 
 
 async def process_message(msg, is_edit: bool = False, source: str = "event"):
-    global last_alert_text, last_alert_time
+    global last_alert_text, last_alert_time, pending_trigger_text, pending_trigger_time
 
     text = msg.text or ""
     if not text or not should_process(msg.id, text):
@@ -200,9 +205,28 @@ async def process_message(msg, is_edit: bool = False, source: str = "event"):
     mark_processed(msg.id, text)
 
     if not matched:
-        if prev_text is not None and prev_text != text:
-            log.info("[EDIT-MISS] msg %s text changed but still no match. prev=%s... new=%s...", msg.id, prev_text[:60], text[:60])
-        return False
+        # Trigger phrase present but no location — hold as pending for correlation
+        if any(phrase in text for phrase in REQUIRED_PHRASES):
+            pending_trigger_text = text
+            pending_trigger_time = time.time()
+            log.info("[PENDING] msg %s has trigger phrase but no location — awaiting location message", msg.id)
+            return False
+
+        # Location keywords present — check if a pending trigger is still fresh
+        now = time.time()
+        if pending_trigger_text and (now - pending_trigger_time) <= PENDING_CORRELATION_WINDOW:
+            location_matches = [kw for kw in KEYWORDS if kw in text]
+            if location_matches:
+                log.info("[CORRELATED] msg %s location combined with pending trigger (%.0fs ago)", msg.id, now - pending_trigger_time)
+                text = pending_trigger_text + "\n" + text
+                matched = location_matches
+                pending_trigger_text = ""
+                pending_trigger_time = 0.0
+
+        if not matched:
+            if prev_text is not None and prev_text != text:
+                log.info("[EDIT-MISS] msg %s text changed but still no match. prev=%s... new=%s...", msg.id, prev_text[:60], text[:60])
+            return False
 
     cleaned_text = clean_message(text)
 

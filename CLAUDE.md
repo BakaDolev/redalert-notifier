@@ -10,9 +10,10 @@ Runs in Docker, deployed on Unraid. Docker image is auto-built via GitHub Action
 ## How message matching works
 
 1. **Standard Alerts:** 
-   - Message must contain at least one **trigger phrase**: `מקור האיום`, `יציאות`, `צפי אזעקות`, `שיגורים`, `איום לישראל`, `זוהה`, or `גם`.
+   - Message must contain at least one **trigger phrase**: `מקור האיום`, `יציאות`, `צפי אזעקות`, `שיגורים`, `שיגור`, `איום לישראל`, `זוהה`, or `גם`.
    - Then it checks for **location keywords** (Hebrew, with prefix variations for ב/ל/ה).
    - Both conditions must be true to trigger the webhook.
+   - **Split-message correlation:** If a trigger phrase arrives without a location (e.g. `שיגור מתימן`), it is held as "pending" for 30 seconds (`PENDING_CORRELATION_WINDOW`). If the next message(s) within that window contain a location keyword (e.g. `לכיוון מרכז`), the two texts are combined into one alert.
 
 2. **Interception Follow-ups:**
    - If a message contains an interception phrase (`יורט`).
@@ -48,6 +49,6 @@ Everything else (keywords, required phrases, interception logic, retries, health
 
 - **Keep this file up to date** — update CLAUDE.md whenever changes affect project structure, matching logic, env vars, deployment, or conventions
 - Never commit `.env` — it contains API keys
-- Always push changes so GitHub Actions builds a new image
+- Always commit and push changes after making them so GitHub Actions builds a new image
 - When editing keywords, include all Hebrew prefix variations (ב/ל/ה)
 - Telethon logger is set to WARNING to avoid log spam — don't change this
