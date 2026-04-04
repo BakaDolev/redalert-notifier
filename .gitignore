@@ -3,3 +3,7 @@ session/
 __pycache__/
 *.pyc
 docker.logs
+
+# AI agent config files
+.cursorrules
+AGENTS.md
