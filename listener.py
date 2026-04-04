@@ -201,6 +201,7 @@ async def main():
     while True:
         if http_session is None or http_session.closed:
             http_session = aiohttp.ClientSession()
+        healthcheck_task = None
         try:
             await client.start()
 
@@ -215,7 +216,7 @@ async def main():
                 msgs = await client.get_messages(chat, limit=1)
                 min_ids[id(chat)] = msgs[0].id if msgs else 0
 
-            asyncio.create_task(healthcheck_loop())
+            healthcheck_task = asyncio.create_task(healthcheck_loop())
             update_healthcheck()
 
             while True:
@@ -234,6 +235,8 @@ async def main():
             await asyncio.sleep(10)
 
         finally:
+            if healthcheck_task:
+                healthcheck_task.cancel()
             if http_session and not http_session.closed:
                 await http_session.close()
 
