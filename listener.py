@@ -46,15 +46,19 @@ INTERCEPTION_PHRASES = ["יורט"]
 FOLLOWUP_WINDOW = 30 * 60  # seconds — interception alerts sent only within this window after a match
 POLL_INTERVAL = 10  # fallback poll interval in seconds
 WEBHOOK_RETRIES = 3
+TEXT_DEDUP_WINDOW = 5 * 60  # seconds — suppress duplicate text content within this window
 HEALTHCHECK_FILE = Path("/tmp/healthcheck")
 
 TEST_MODE = os.environ.get("TEST", "false").lower() == "true"
 TEST_GROUP = os.environ.get("TEST_GROUP", "")
 SESSION_PATH = os.environ.get("SESSION_PATH", "session/telegram")
 
-# Track processed messages: id -> text hash (to detect edits)
+# Track processed messages: id -> text (to detect edits)
 MAX_TRACKED_MESSAGES = 200
 processed_messages: OrderedDict[int, str] = OrderedDict()
+
+# Track recently forwarded text content: text -> timestamp (to suppress duplicate text)
+recent_texts: dict[str, float] = {}
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 http_session = None
@@ -194,6 +198,18 @@ async def process_message(msg, is_edit: bool = False):
         return False
 
     cleaned_text = clean_message(text)
+
+    # Suppress duplicate text content forwarded within the dedup window
+    now = time.time()
+    # Evict expired entries
+    for k in list(recent_texts.keys()):
+        if now - recent_texts[k] > TEXT_DEDUP_WINDOW:
+            del recent_texts[k]
+    if cleaned_text in recent_texts:
+        log.info("Skipping duplicate text (msg %s, last seen %.0fs ago)", msg.id, now - recent_texts[cleaned_text])
+        return False
+    recent_texts[cleaned_text] = now
+
     action = "EDIT" if is_edit else "NEW"
 
     payload = {
@@ -232,9 +248,6 @@ async def poll_loop(chats, min_ids: dict):
                     for msg in reversed(messages):
                         min_ids[key] = max(min_ids[key], msg.id)
                         await process_message(msg, is_edit=False)
-                recent = await client.get_messages(chat, limit=5)
-                for msg in recent:
-                    await process_message(msg, is_edit=True)
             except Exception:
                 log.exception("Poll error for chat %s", key)
 
@@ -247,6 +260,8 @@ async def main():
             http_session = aiohttp.ClientSession()
         healthcheck_task = None
         poll_task = None
+        on_new = None
+        on_edit = None
         try:
             await client.start()
 
@@ -289,6 +304,10 @@ async def main():
             await asyncio.sleep(10)
 
         finally:
+            if on_new:
+                client.remove_event_handler(on_new)
+            if on_edit:
+                client.remove_event_handler(on_edit)
             if poll_task:
                 poll_task.cancel()
             if healthcheck_task:
