@@ -41,7 +41,9 @@ KEYWORDS = [
     'איו"ש', "שומרון", "בשומרון", "לשומרון",
     "גוש דן", "בגוש דן", "לגוש דן",
 ]
-REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות"]
+REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות", "שיגורים", "איום לישראל", "זוהה", "גם"]
+INTERCEPTION_PHRASES = ["יורט"]
+FOLLOWUP_WINDOW = 30 * 60  # seconds — interception alerts sent only within this window after a match
 POLL_INTERVAL = 10  # fallback poll interval in seconds
 WEBHOOK_RETRIES = 3
 HEALTHCHECK_FILE = Path("/tmp/healthcheck")
@@ -56,6 +58,10 @@ processed_messages: OrderedDict[int, str] = OrderedDict()
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 http_session = None
+
+# Track last sent alert for follow-up context
+last_alert_text: str = ""
+last_alert_time: datetime | None = None
 
 
 def should_process(message_id: int, text: str) -> bool:
@@ -113,6 +119,14 @@ def clean_message(text: str) -> str:
 
 
 def matches_keywords(text: str) -> list[str]:
+    # Interception alerts — no location keyword needed, but require recent alert
+    if any(p in text for p in INTERCEPTION_PHRASES):
+        if last_alert_time is not None:
+            elapsed = (datetime.now(timezone.utc) - last_alert_time).total_seconds()
+            if elapsed <= FOLLOWUP_WINDOW:
+                return ["יורט"]
+        return []
+
     if not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
     return [kw for kw in KEYWORDS if kw in text]
@@ -167,24 +181,21 @@ async def healthcheck_loop():
 
 
 async def process_message(msg, is_edit: bool = False):
-    """Check a message against keywords and send to webhook if matched."""
-    text = msg.text or ""
-    if not text:
-        return False
+    global last_alert_text, last_alert_time
 
-    if not should_process(msg.id, text):
+    text = msg.text or ""
+    if not text or not should_process(msg.id, text):
         return False
 
     matched = matches_keywords(text)
+    mark_processed(msg.id, text)
+
     if not matched:
-        # Still mark non-matching messages so we re-check if text changes
-        mark_processed(msg.id, text)
         return False
 
-    mark_processed(msg.id, text)
     cleaned_text = clean_message(text)
-
     action = "EDIT" if is_edit else "NEW"
+
     payload = {
         "text": cleaned_text,
         "matched_keywords": matched,
@@ -194,10 +205,17 @@ async def process_message(msg, is_edit: bool = False):
         "received_at": datetime.now(timezone.utc).isoformat(),
         "group": str(GROUP),
         "is_edit": is_edit,
+        "context": last_alert_text if last_alert_text else None,
     }
 
-    log.info("[%s] Matched keywords %s in message %s: %s", action, matched, msg.id, text[:80])
+    log.info("[%s] Matched %s in msg %s: %s", action, matched, msg.id, text[:80])
     await send_to_webhook(payload)
+
+    # Update last alert context (not for interceptions — they are follow-ups, not the alert itself)
+    if "יורט" not in matched:
+        last_alert_text = cleaned_text
+        last_alert_time = datetime.now(timezone.utc)
+
     return True
 
 
