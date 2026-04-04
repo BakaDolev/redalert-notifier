@@ -9,7 +9,7 @@ from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyUnregisteredError,
     SessionRevokedError,
@@ -42,7 +42,7 @@ KEYWORDS = [
     "גוש דן", "בגוש דן", "לגוש דן",
 ]
 REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות"]
-POLL_INTERVAL = 3
+POLL_INTERVAL = 10  # fallback poll interval in seconds
 WEBHOOK_RETRIES = 3
 HEALTHCHECK_FILE = Path("/tmp/healthcheck")
 
@@ -201,24 +201,24 @@ async def process_message(msg, is_edit: bool = False):
     return True
 
 
-async def poll_chat(chat, min_id: int) -> int:
-    """Poll for new messages and check recent messages for edits."""
-    # 1. Check for NEW messages
-    messages = await client.get_messages(chat, limit=10, min_id=min_id)
-    new_max_id = min_id
-
-    if messages:
-        for msg in reversed(messages):
-            new_max_id = max(new_max_id, msg.id)
-            await process_message(msg, is_edit=False)
-
-    # 2. Re-check last 5 messages for edits (text changes)
-    recent = await client.get_messages(chat, limit=5)
-    if recent:
-        for msg in recent:
-            await process_message(msg, is_edit=True)
-
-    return new_max_id
+async def poll_loop(chats, min_ids: dict):
+    """Fallback poller — catches anything events missed (archived group, flaky connection)."""
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        update_healthcheck()
+        for chat in chats:
+            key = id(chat)
+            try:
+                messages = await client.get_messages(chat, limit=10, min_id=min_ids[key])
+                if messages:
+                    for msg in reversed(messages):
+                        min_ids[key] = max(min_ids[key], msg.id)
+                        await process_message(msg, is_edit=False)
+                recent = await client.get_messages(chat, limit=5)
+                for msg in recent:
+                    await process_message(msg, is_edit=True)
+            except Exception:
+                log.exception("Poll error for chat %s", key)
 
 
 async def main():
@@ -228,46 +228,39 @@ async def main():
         if http_session is None or http_session.closed:
             http_session = aiohttp.ClientSession()
         healthcheck_task = None
+        poll_task = None
         try:
             await client.start()
 
             chats = await resolve_groups()
-            log.info("Polling %d group(s) every %ss", len(chats), POLL_INTERVAL)
+            log.info("Listening to %d group(s) — events + %ss fallback poll", len(chats), POLL_INTERVAL)
             log.info("Keywords: %s", KEYWORDS)
             log.info("Webhook: %s", WEBHOOK_URL)
 
-            # Seed min_id with the latest message so we only process new ones
+            # Seed cache and min_ids with recent messages
             min_ids = {}
             for chat in chats:
-                msgs = await client.get_messages(chat, limit=1)
+                msgs = await client.get_messages(chat, limit=5)
                 min_ids[id(chat)] = msgs[0].id if msgs else 0
-                # Pre-populate processed cache for recent messages
-                recent = await client.get_messages(chat, limit=5)
-                for msg in recent:
+                for msg in msgs:
                     if msg.text:
                         mark_processed(msg.id, msg.text)
 
+            # Event handlers — instant delivery
+            @client.on(events.NewMessage(chats=chats))
+            async def on_new(event):
+                await process_message(event.message, is_edit=False)
+
+            @client.on(events.MessageEdited(chats=chats))
+            async def on_edit(event):
+                await process_message(event.message, is_edit=True)
+
+            # Fallback poller — safety net
+            poll_task = asyncio.create_task(poll_loop(chats, min_ids))
             healthcheck_task = asyncio.create_task(healthcheck_loop())
             update_healthcheck()
 
-            poll_count = 0
-            while True:
-                await asyncio.sleep(POLL_INTERVAL)
-                update_healthcheck()
-                poll_count += 1
-
-                # Log every 100 polls (~5 min) to confirm bot is alive
-                if poll_count % 100 == 0:
-                    log.info("Poll #%d — still running, connection: %s", poll_count, client.is_connected())
-
-                # Reconnect if connection dropped
-                if not client.is_connected():
-                    log.warning("Connection lost, reconnecting...")
-                    await client.connect()
-
-                for chat in chats:
-                    key = id(chat)
-                    min_ids[key] = await poll_chat(chat, min_ids[key])
+            await client.run_until_disconnected()
 
         except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedBanError) as e:
             log.critical("Session is dead (%s). Delete session/ folder and re-authenticate.", type(e).__name__)
@@ -278,6 +271,8 @@ async def main():
             await asyncio.sleep(10)
 
         finally:
+            if poll_task:
+                poll_task.cancel()
             if healthcheck_task:
                 healthcheck_task.cancel()
             if http_session and not http_session.closed:
