@@ -41,7 +41,7 @@ KEYWORDS = [
     'איו"ש', "שומרון", "בשומרון", "לשומרון",
     "גוש דן", "בגוש דן", "לגוש דן",
 ]
-REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות", "שיגורים", "איום לישראל", "זוהה", "גם"]
+REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות", "שיגורים", "איום לישראל", "זוהה", "גם", "מיקוד הטיל"]
 INTERCEPTION_PHRASES = ["יורט"]
 FOLLOWUP_WINDOW = 30 * 60  # seconds — interception alerts sent only within this window after a match
 POLL_INTERVAL = 10  # fallback poll interval in seconds
