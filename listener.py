@@ -69,7 +69,7 @@ last_alert_text: str = ""
 last_alert_time: datetime | None = None
 
 # Track pending trigger-only messages awaiting a location follow-up
-pending_trigger_text: str = ""
+pending_trigger_texts: list[str] = []
 pending_trigger_time: float = 0.0
 
 
@@ -190,7 +190,7 @@ async def healthcheck_loop():
 
 
 async def process_message(msg, is_edit: bool = False, source: str = "event"):
-    global last_alert_text, last_alert_time, pending_trigger_text, pending_trigger_time
+    global last_alert_text, last_alert_time, pending_trigger_texts, pending_trigger_time
 
     text = msg.text or ""
     if not text or not should_process(msg.id, text):
@@ -204,23 +204,36 @@ async def process_message(msg, is_edit: bool = False, source: str = "event"):
     matched = matches_keywords(text)
     mark_processed(msg.id, text)
 
+    # If matched directly but there are fresh pending triggers, combine for richer context
+    if matched and pending_trigger_texts:
+        now = time.time()
+        if (now - pending_trigger_time) <= PENDING_CORRELATION_WINDOW:
+            log.info("[CORRELATED] msg %s matched directly — prepending %d pending trigger(s) (%.0fs ago)", msg.id, len(pending_trigger_texts), now - pending_trigger_time)
+            text = "\n".join(pending_trigger_texts) + "\n" + text
+        pending_trigger_texts = []
+        pending_trigger_time = 0.0
+
     if not matched:
-        # Trigger phrase present but no location — hold as pending for correlation
+        # Trigger phrase present but no location — accumulate as pending for correlation
         if any(phrase in text for phrase in REQUIRED_PHRASES):
-            pending_trigger_text = text
-            pending_trigger_time = time.time()
-            log.info("[PENDING] msg %s has trigger phrase but no location — awaiting location message", msg.id)
+            now = time.time()
+            # Reset if previous pending expired
+            if pending_trigger_texts and (now - pending_trigger_time) > PENDING_CORRELATION_WINDOW:
+                pending_trigger_texts = []
+            pending_trigger_texts.append(text)
+            pending_trigger_time = now
+            log.info("[PENDING] msg %s has trigger phrase but no location — awaiting location message (%d pending)", msg.id, len(pending_trigger_texts))
             return False
 
-        # Location keywords present — check if a pending trigger is still fresh
+        # Location keywords present — check if pending triggers are still fresh
         now = time.time()
-        if pending_trigger_text and (now - pending_trigger_time) <= PENDING_CORRELATION_WINDOW:
+        if pending_trigger_texts and (now - pending_trigger_time) <= PENDING_CORRELATION_WINDOW:
             location_matches = [kw for kw in KEYWORDS if kw in text]
             if location_matches:
-                log.info("[CORRELATED] msg %s location combined with pending trigger (%.0fs ago)", msg.id, now - pending_trigger_time)
-                text = pending_trigger_text + "\n" + text
+                log.info("[CORRELATED] msg %s location combined with %d pending trigger(s) (%.0fs ago)", msg.id, len(pending_trigger_texts), now - pending_trigger_time)
+                text = "\n".join(pending_trigger_texts) + "\n" + text
                 matched = location_matches
-                pending_trigger_text = ""
+                pending_trigger_texts = []
                 pending_trigger_time = 0.0
 
         if not matched:

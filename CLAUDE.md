@@ -13,7 +13,7 @@ Runs in Docker, deployed on Unraid. Docker image is auto-built via GitHub Action
    - Message must contain at least one **trigger phrase**: `מקור האיום`, `יציאות`, `צפי אזעקות`, `שיגורים`, `שיגור`, `איום לישראל`, `זוהה`, or `גם`.
    - Then it checks for **location keywords** (Hebrew, with prefix variations for ב/ל/ה).
    - Both conditions must be true to trigger the webhook.
-   - **Split-message correlation:** If a trigger phrase arrives without a location (e.g. `שיגור מתימן`), it is held as "pending" for 30 seconds (`PENDING_CORRELATION_WINDOW`). If the next message(s) within that window contain a location keyword (e.g. `לכיוון מרכז`), the two texts are combined into one alert.
+   - **Split-message correlation:** If trigger phrases arrive without a location keyword, they are **accumulated** as pending for 30 seconds (`PENDING_CORRELATION_WINDOW`). When a message with a location keyword arrives (either on its own or with a trigger phrase), all pending messages are combined into one alert. This handles multi-message sequences like: msg1 "שיגורים זוהו...בקעה", msg2 "צפי אזעקות...הבקעה", msg3 "מרכז גם" → all three combined.
 
 2. **Interception Follow-ups:**
    - If a message contains an interception phrase (`יורט`).
