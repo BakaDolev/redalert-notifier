@@ -43,6 +43,11 @@ KEYWORDS = [
 ]
 REQUIRED_PHRASES = ["מקור האיום", "יציאות", "צפי אזעקות", "שיגורים", "שיגור", "איום לישראל", "זוהה", "גם", "מיקוד הטיל"]
 INTERCEPTION_PHRASES = ["יורט"]
+# Bare "מרכז" can false-positive on compound region names like "מרכז הנגב".
+# Prefixed forms (המרכז, למרכז, במרכז) don't have this problem.
+FALSE_POSITIVE_PATTERNS = {
+    "מרכז": re.compile(r'מרכז\s+(?:הנגב|הגליל|הארץ|הגולן|השומרון)'),
+}
 FOLLOWUP_WINDOW = 30 * 60  # seconds — interception alerts sent only within this window after a match
 PENDING_CORRELATION_WINDOW = 30  # seconds — hold trigger-only messages waiting for a location follow-up
 POLL_INTERVAL = 10  # fallback poll interval in seconds
@@ -138,7 +143,14 @@ def matches_keywords(text: str) -> list[str]:
 
     if not any(phrase in text for phrase in REQUIRED_PHRASES):
         return []
-    return [kw for kw in KEYWORDS if kw in text]
+    matched = []
+    for kw in KEYWORDS:
+        if kw in text:
+            fp = FALSE_POSITIVE_PATTERNS.get(kw)
+            if fp and fp.search(text):
+                continue
+            matched.append(kw)
+    return matched
 
 
 async def resolve_invite(group_str: str):
