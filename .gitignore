@@ -8,6 +8,10 @@ docker.logs
 .cursorrules
 AGENTS.md
 CLAUDE.md
+CODEX.md
+GEMINI.md
+.claude/
+.cursor/
 
 # IDE config
 *.code-workspace
