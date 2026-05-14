@@ -7,3 +7,7 @@ docker.logs
 # AI agent config files
 .cursorrules
 AGENTS.md
+CLAUDE.md
+
+# IDE config
+*.code-workspace
