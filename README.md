@@ -11,9 +11,9 @@ Telegram Red Alert Channel
         │
         ▼
    ┌──────────┐
-   │ listener  │  Event-driven + 10s fallback poll
-   │  .py      │  Keyword matching (region-based)
-   │           │  Message correlation & deduplication
+   │ listener │  Event-driven + 10s fallback poll
+   │  .py     │  Keyword matching (region-based)
+   │          │  Message correlation & deduplication
    └────┬─────┘
         │
         ▼
